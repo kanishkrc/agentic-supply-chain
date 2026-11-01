@@ -17,6 +17,20 @@ Neighbour topology (same as F2 / F4):
 
 All agents within a round propose in parallel; rounds execute sequentially.
 
+Orchestration (LangGraph):
+  The negotiation for each simulation step is a compiled LangGraph
+  StateGraph (paper Fig 7):
+
+      START -> compute_tools -> propose_round --(round < num_iter)--> propose_round
+                                              +--(round == num_iter)--> finalize -> END
+
+  * compute_tools  — runs the Demand Forecast + EOQ tools once per agent
+  * propose_round  — one negotiation round: every agent sees its neighbours'
+                     previous-round proposals and proposes a new order
+  * finalize       — applies the EOQ safety floor; the result is the order
+  The conditional edge after propose_round is the negotiation loop; the
+  round counter in the graph state decides when consensus-seeking ends.
+
 Paper §4.5 / Framework 5.
 
 Usage
@@ -31,7 +45,9 @@ from __future__ import annotations
 import argparse
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TypedDict
+
+from langgraph.graph import END, START, StateGraph
 
 from supply_chain.config       import DEFAULT_CONFIG, ROLE_LABELS
 from supply_chain.demand       import get_paper_demand
@@ -112,38 +128,65 @@ def llm_propose(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Full negotiation for one simulation step
+# LangGraph negotiation state machine (one invocation per simulation step)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def negotiate_step(
-    client: LLMClient,
-    obs_list: List[dict],
-    cfg: dict,
-    num_rounds: int,
-    verbose: bool = False,
-) -> List[int]:
-    """
-    Run `num_rounds` negotiation rounds for all agents at one simulation step.
+class NegotiationState(TypedDict):
+    """State carried through the negotiation graph for one simulation step."""
+    obs_list:     List[dict]             # local observation of each agent
+    num_rounds:   int                    # negotiation rounds to run (num_iter)
+    tool_results: List[Dict]             # Demand Forecast + EOQ per agent
+    proposals:    List[Optional[int]]    # latest proposal of each agent
+    round:        int                    # rounds completed so far
+    final_orders: List[int]              # committed orders (after finalize)
 
-    Returns the final proposals (list of ints, one per agent).
+
+def build_negotiation_graph(
+    client: LLMClient,
+    cfg: dict,
+    verbose: bool = False,
+):
     """
+    Build and compile the F5 negotiation graph (paper Fig 7).
+
+    Nodes
+    -----
+    compute_tools : tool outputs for every agent (fixed within a step)
+    propose_round : one round — all agents propose in parallel, each seeing
+                    its neighbours' proposals from the previous round
+    finalize      : EOQ safety floor -> committed orders
+
+    Edges
+    -----
+    START -> compute_tools -> propose_round
+    propose_round -> propose_round   while round < num_rounds  (negotiation loop)
+    propose_round -> finalize        once round == num_rounds
+    finalize -> END
+    """
+    from run_f3 import run_eoq_tool
+
     n = cfg["n_agents"]
 
-    # Compute tools once per agent (tools don't change within a step)
-    tool_results_list = [compute_tools(obs_list[i], cfg) for i in range(n)]
+    def compute_tools_node(state: NegotiationState) -> dict:
+        obs_list = state["obs_list"]
+        return {
+            "tool_results": [compute_tools(obs_list[i], cfg) for i in range(n)],
+            "proposals":    [None] * n,
+            "round":        0,
+        }
 
-    proposals: List[Optional[int]] = [None] * n
-
-    for r in range(1, num_rounds + 1):
-        neighbour_msgs = build_neighbour_proposals(proposals, n)
+    def propose_round_node(state: NegotiationState) -> dict:
+        r              = state["round"] + 1
+        num_rounds     = state["num_rounds"]
+        neighbour_msgs = build_neighbour_proposals(state["proposals"], n)
 
         with ThreadPoolExecutor(max_workers=n) as pool:
             futures = {
                 pool.submit(
                     llm_propose,
                     client,
-                    obs_list[i],
-                    tool_results_list[i],
+                    state["obs_list"][i],
+                    state["tool_results"][i],
                     r,
                     num_rounds,
                     neighbour_msgs[i],
@@ -157,21 +200,77 @@ def negotiate_step(
                 new_proposals[futures[fut]] = fut.result()
 
         proposals = [new_proposals[i] for i in range(n)]
-
         if verbose:
             print(f"      -- Round {r} proposals: {proposals}")
 
-    # Programmatic safety net: use EOQ as the floor (lower than demand_forecast).
-    # The improved prompts carry the main backlog-clearing logic; this net only
-    # catches true zero-collapse when EOQ itself is positive.
-    from run_f3 import run_eoq_tool
-    eoq_floors = [run_eoq_tool(obs_list[i], cfg) for i in range(n)]
-    final = [max(proposals[i], eoq_floors[i]) for i in range(n)]  # type: ignore[index]
+        return {"proposals": proposals, "round": r}
 
-    if verbose and any(final[i] > proposals[i] for i in range(n)):
-        print(f"      -- EOQ floor applied: proposals={proposals} -> final={final}")
+    def route_after_round(state: NegotiationState) -> str:
+        """Negotiation loop: keep proposing until num_rounds is reached."""
+        if state["round"] < state["num_rounds"]:
+            return "propose_round"
+        return "finalize"
 
-    return final
+    def finalize_node(state: NegotiationState) -> dict:
+        # Programmatic safety net: use EOQ as the floor (lower than
+        # demand_forecast). The prompts carry the main backlog-clearing logic;
+        # this net only catches true zero-collapse when EOQ itself is positive.
+        proposals  = state["proposals"]
+        eoq_floors = [run_eoq_tool(state["obs_list"][i], cfg) for i in range(n)]
+        final      = [max(proposals[i], eoq_floors[i]) for i in range(n)]  # type: ignore[arg-type]
+
+        if verbose and any(final[i] > proposals[i] for i in range(n)):  # type: ignore[operator]
+            print(f"      -- EOQ floor applied: proposals={proposals} -> final={final}")
+
+        return {"final_orders": final}
+
+    graph = StateGraph(NegotiationState)
+    graph.add_node("compute_tools", compute_tools_node)
+    graph.add_node("propose_round", propose_round_node)
+    graph.add_node("finalize",      finalize_node)
+
+    graph.add_edge(START, "compute_tools")
+    graph.add_edge("compute_tools", "propose_round")
+    graph.add_conditional_edges(
+        "propose_round",
+        route_after_round,
+        {"propose_round": "propose_round", "finalize": "finalize"},
+    )
+    graph.add_edge("finalize", END)
+
+    return graph.compile()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Full negotiation for one simulation step
+# ─────────────────────────────────────────────────────────────────────────────
+
+def negotiate_step(
+    client: LLMClient,
+    obs_list: List[dict],
+    cfg: dict,
+    num_rounds: int,
+    verbose: bool = False,
+    graph=None,
+) -> List[int]:
+    """
+    Run `num_rounds` negotiation rounds for all agents at one simulation step
+    by invoking the LangGraph negotiation graph.
+
+    Pass a pre-compiled `graph` (from build_negotiation_graph) to avoid
+    recompiling it every step; one is built on the fly if omitted.
+
+    Returns the final orders (list of ints, one per agent).
+    """
+    if graph is None:
+        graph = build_negotiation_graph(client, cfg, verbose=verbose)
+
+    result = graph.invoke(
+        {"obs_list": obs_list, "num_rounds": num_rounds},
+        # each round is one graph step; leave headroom for --rounds overrides
+        config={"recursion_limit": num_rounds + 10},
+    )
+    return result["final_orders"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -197,7 +296,11 @@ def run_f5(
     print(f"\n  Model       : {client.model}")
     print(f"  Steps       : {cfg['n_steps']}, agents: {cfg['n_agents']}, "
           f"lead_time: {cfg['lead_time']}")
-    print(f"  Neg. rounds : {n_rounds}\n")
+    print(f"  Neg. rounds : {n_rounds}")
+    print(f"  Orchestration: LangGraph negotiation graph\n")
+
+    # Compile the negotiation state machine once and reuse it every step
+    graph = build_negotiation_graph(client, cfg, verbose=verbose)
 
     step_times: List[float] = []
 
@@ -207,7 +310,8 @@ def run_f5(
         if verbose or (t % log_interval == 0):
             print(f"  Step {t:3d}/{cfg['n_steps']} -- customer demand: {demands[t]}")
 
-        actions = negotiate_step(client, obs, cfg, n_rounds, verbose=verbose)
+        actions = negotiate_step(client, obs, cfg, n_rounds, verbose=verbose,
+                                 graph=graph)
 
         obs, costs, done, info = env.step(actions)
 

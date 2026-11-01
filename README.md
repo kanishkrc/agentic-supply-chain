@@ -24,7 +24,22 @@ The project evaluates 5 progressively sophisticated LLM-based consensus-seeking 
 5. **F5 (Negotiation + Tools):** Neighboring agents engage in a bilateral, 3-round negotiation state machine managed by LangGraph before committing to a final order, forcing mutual consistency and preventing extreme demand spikes.
 
 ## ⚙️ How It Works (F5 Negotiation Protocol)
-Using LangGraph, the most advanced framework (F5) forces agents into a cyclical negotiation:
+Each simulation step, F5 invokes a compiled **LangGraph `StateGraph`** (`build_negotiation_graph` in `run_f5.py`). The graph state holds every agent's observation, tool outputs, current proposals and a round counter; a conditional edge loops the `propose_round` node until `num_iter = 3` rounds are done:
+
+```mermaid
+graph TD;
+    START([start]) --> compute_tools;
+    compute_tools --> propose_round;
+    propose_round -. "round < 3" .-> propose_round;
+    propose_round -. "round = 3" .-> finalize;
+    finalize --> END([end]);
+```
+
+- **compute_tools:** runs the Demand Forecast and EOQ tools once per agent.
+- **propose_round:** one negotiation round; the three agents call Gemini in parallel, each seeing its neighbours' previous-round proposals.
+- **finalize:** applies the EOQ safety floor and returns the committed orders.
+
+Inside the loop, the rounds work as follows:
 - **Round 1 (Initiation):** Agents propose an order based on their tool anchor. The demand forecast acts as a hard minimum floor.
 - **Round 2 (Response):** Agents receive neighbor proposals. The system programmatically extracts these numerical values via Regex and calculates a midpoint guidance value to encourage convergence.
 - **Round 3 (Final Decision):** Final convergence. Proposals become committed orders, explicitly discouraging erratic spikes and smoothing the supply chain.
@@ -40,6 +55,11 @@ python run_f1.py
 To run the full multi-round negotiation framework (F5):
 ```bash
 python run_f5.py --rounds 3
+```
+
+To check the LangGraph negotiation without any API calls (a deterministic fake model; verifies the graph's structure, round count, and that a full 200-step run matches the original round-loop implementation order-for-order):
+```bash
+python test_f5_graph.py
 ```
 
 *This project was developed as part of a Bachelor Thesis Project (BTP).*
